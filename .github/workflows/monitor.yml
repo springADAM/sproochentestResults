@@ -3,7 +3,9 @@ name: INL Results Monitor
 
 on:
   schedule:
-    - cron: "7,17,27,37,47,57 * * * *"
+    # UTC schedule: Luxembourg is UTC+2 during October 2026.
+    # Runs at minute 7, from 07:00 through 16:00 UTC.
+    - cron: "7 7-16 14-24 10 *"
   workflow_dispatch:
 
 permissions:
@@ -16,7 +18,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - name: Check out repository
@@ -27,52 +29,48 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
-
-
-      - name: Test Telegram notification
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Check Luxembourg monitoring window
+        id: window
         run: |
           python - <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
           import os
-          import requests
 
-          response = requests.post(
-              f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
-              json={
-                  "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-                  "text": "INL monitor diagnostic: Telegram delivery works."
-              },
-              timeout=20,
-          )
+          now = datetime.now(ZoneInfo("Europe/Luxembourg"))
 
-          print("Telegram HTTP status:", response.status_code)
-          data = response.json()
-          print("Telegram API ok:", data.get("ok"))
+          start = datetime(2026, 10, 14, 9, 0, tzinfo=now.tzinfo)
+          end = datetime(2026, 10, 24, 19, 0, tzinfo=now.tzinfo)
 
-          if not data.get("ok"):
-              print("Telegram error:", data.get("description", "Unknown error"))
-              raise SystemExit(1)
+          allowed = start <= now < end and 9 <= now.hour < 19
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"run={'true' if allowed else 'false'}\n")
+
+          print(f"Luxembourg local time: {now.isoformat()}")
+          print(f"Monitoring window active: {allowed}")
           PY
 
-      - name: Run monitor
+      - name: Install Python dependencies
+        if: steps.window.outputs.run == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright requests
+          python -m playwright install --with-deps chromium
+
+      - name: Run INL results monitor
+        if: steps.window.outputs.run == 'true' || github.event_name == 'workflow_dispatch'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MYINL_EMAIL: ${{ secrets.MYINL_EMAIL }}
           MYINL_PASSWORD: ${{ secrets.MYINL_PASSWORD }}
-          MYINL_REGISTRATION_URL: ${{ vars.MYINL_REGISTRATION_URL }}
+          MYINL_REGISTRATION_URL: https://myinl.inll.lu/my/exam/registrations
           EXAM_DATE: "30/09/2026"
         run: python monitor.py
 
-      - name: Save updated state
-        if: success()
+      - name: Persist monitoring state
+        if: success() && (steps.window.outputs.run == 'true' || github.event_name == 'workflow_dispatch')
         run: |
           if ! git diff --quiet -- state.json; then
             git config user.name "github-actions[bot]"
