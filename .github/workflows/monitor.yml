@@ -16,7 +16,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - name: Check out repository
@@ -27,23 +27,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install playwright requests
           python -m playwright install --with-deps chromium
 
-      - name: Run monitor
+      - name: Run INL results monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MYINL_EMAIL: ${{ secrets.MYINL_EMAIL }}
           MYINL_PASSWORD: ${{ secrets.MYINL_PASSWORD }}
-          MYINL_REGISTRATION_URL: ${{ vars.MYINL_REGISTRATION_URL }}
+          MYINL_REGISTRATION_URL: https://myinl.inll.lu/fr_FR/my/exam/registrations
           EXAM_DATE: "30/09/2026"
         run: python monitor.py
 
-      - name: Save updated state
+      - name: Persist monitoring state
         if: success()
         run: |
           if ! git diff --quiet -- state.json; then

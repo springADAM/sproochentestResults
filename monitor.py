@@ -3,26 +3,32 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
-from urllib.parse import urljoin
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-LOGIN_URL = "https://myinl.inll.lu/fr_FR/web/login"
+LOGIN_URL = "https://myinl.inll.lu/web/login"
 REGISTRATION_URL = os.getenv(
     "MYINL_REGISTRATION_URL",
-    "https://myinl.inll.lu/my/home"
+    "https://myinl.inll.lu/my/exam/registrations",
 )
 
-STATE_FILE = Path("state.json")
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 EMAIL = os.environ["MYINL_EMAIL"]
 PASSWORD = os.environ["MYINL_PASSWORD"]
 
-EXAM_KEYWORDS = ("sproochentest",)
+EXAM_KEYWORD = "sproochentest"
 EXAM_DATE = os.getenv("EXAM_DATE", "30/09/2026")
+STATE_FILE = Path("state.json")
+
+
+def normalize(value):
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(c for c in value if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", value).strip().lower()
 
 
 def send_telegram(message):
@@ -38,7 +44,7 @@ def send_telegram(message):
     response.raise_for_status()
 
     if not response.json().get("ok"):
-        raise RuntimeError("Telegram rejected the notification")
+        raise RuntimeError("Telegram failed to send the notification")
 
 
 def load_state():
@@ -47,8 +53,10 @@ def load_state():
 
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "state.json is unreadable. Refusing to reset the baseline."
+        ) from error
 
 
 def save_state(state):
@@ -58,40 +66,63 @@ def save_state(state):
     )
 
 
-def normalize(text):
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def login(page):
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
 
-    page.get_by_label("E-mail").fill(EMAIL)
-    page.get_by_label("Mot de passe").fill(PASSWORD)
-    page.get_by_role("button", name="Se connecter").click()
+    # If the browser is already authenticated, the login page may redirect.
+    if "/web/login" not in page.url.lower():
+        return
+
+    email_input = page.locator(
+        'input[type="email"], input[name="login"], input[name="email"]'
+    ).first
+    password_input = page.locator('input[type="password"]').first
+
+    if email_input.count() == 0 or password_input.count() == 0:
+        raise RuntimeError(
+            "Could not identify the MyINL login fields. "
+            "The login page may have changed."
+        )
+
+    email_input.fill(EMAIL)
+    password_input.fill(PASSWORD)
+
+    submit = page.locator(
+        'button[type="submit"], input[type="submit"]'
+    ).first
+
+    if submit.count() == 0:
+        raise RuntimeError("Could not identify the login submit button")
+
+    submit.click()
 
     try:
         page.wait_for_load_state("networkidle", timeout=15000)
     except PlaywrightTimeoutError:
         pass
 
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(1500)
 
-    current_url = page.url.lower()
-    page_text = normalize(page.locator("body").inner_text())
+    if "/web/login" in page.url.lower():
+        body = normalize(page.locator("body").inner_text())
 
-    if "web/login" in current_url or "mot de passe" in page_text.lower():
-        # A login page can also contain a password-reset link, so inspect
-        # the actual password input before declaring authentication failed.
-        if page.locator('input[type="password"]').count() > 0:
+        if (
+            "invalid" in body
+            or "incorrect" in body
+            or "invalide" in body
+            or "incorrect" in body
+        ):
             raise RuntimeError(
-                "Login may have failed. Check credentials or any additional "
-                "authentication challenge."
+                "MyINL rejected the login. Check your credentials."
             )
 
+        raise RuntimeError(
+            "MyINL still shows the login page. Authentication may require "
+            "different form selectors, additional verification, or a CAPTCHA."
+        )
 
-def open_registrations(page):
-    # If your account uses a different route, set MYINL_REGISTRATION_URL
-    # in the GitHub Actions workflow.
+
+def get_registration_row(page):
     page.goto(
         REGISTRATION_URL,
         wait_until="domcontentloaded",
@@ -103,123 +134,176 @@ def open_registrations(page):
     except PlaywrightTimeoutError:
         pass
 
-    if "web/login" in page.url.lower():
-        raise RuntimeError("MyINL redirected to login; authentication expired")
-
-    body = normalize(page.locator("body").inner_text())
-
-    if "Mes inscriptions".lower() not in body.lower():
-        # Try the visible account navigation if the dashboard route differs.
-        link = page.get_by_text("Mes inscriptions", exact=False)
-
-        if link.count() > 0:
-            link.first.click()
-            page.wait_for_timeout(2000)
-            body = normalize(page.locator("body").inner_text())
-
-    return body
-
-
-def find_exam_registration(page):
-    # Search rendered table rows rather than the whole page, so unrelated
-    # page changes do not trigger a false result alert.
-    rows = page.locator("tr")
-    matches = []
-
-    for index in range(rows.count()):
-        row = rows.nth(index)
-
-        if not row.is_visible():
-            continue
-
-        row_text = normalize(row.inner_text())
-
-        if not all(keyword in row_text.lower() for keyword in EXAM_KEYWORDS):
-            continue
-
-        # Match the exam date when it is present in the row.
-        if EXAM_DATE not in row_text and "2026-09-30" not in row_text:
-            continue
-
-        documents = []
-
-        links = row.locator("a")
-        for link_index in range(links.count()):
-            item = links.nth(link_index)
-            href = item.get_attribute("href")
-
-            if href:
-                documents.append(urljoin(page.url, href))
-
-        # Include the row text and document links in the fingerprint.
-        matches.append({
-            "text": row_text,
-            "documents": sorted(set(documents)),
-        })
-
-    if not matches:
+    if "/web/login" in page.url.lower():
         raise RuntimeError(
-            "Could not find the expected Sproochentest registration row. "
-            "The page layout, URL, or date may need adjustment. "
-            "No state was updated."
+            "MyINL redirected to login. Authentication did not persist."
         )
 
-    if len(matches) > 1:
+    page_heading = normalize(page.locator("body").inner_text())
+
+    if "mes inscriptions" not in page_heading:
         raise RuntimeError(
-            "Found multiple matching exam rows. Refine the exam selector "
-            "before monitoring to avoid tracking the wrong registration."
+            "The expected Mes inscriptions page did not load. "
+            "Check MYINL_REGISTRATION_URL."
         )
 
-    return matches[0]
+    tables = page.locator("table")
+    matching_rows = []
+
+    for table_index in range(tables.count()):
+        table = tables.nth(table_index)
+        headers = table.locator("thead tr").first.locator("th, td")
+
+        if headers.count() == 0:
+            headers = table.locator("tr").first.locator("th, td")
+
+        header_names = [
+            normalize(headers.nth(i).inner_text())
+            for i in range(headers.count())
+        ]
+
+        publication_index = next(
+            (
+                i for i, name in enumerate(header_names)
+                if "date de publication des resultats" in name
+            ),
+            None,
+        )
+
+        if publication_index is None:
+            continue
+
+        rows = table.locator("tbody tr")
+
+        for row_index in range(rows.count()):
+            row = rows.nth(row_index)
+
+            if not row.is_visible():
+                continue
+
+            cells = row.locator("td")
+            if cells.count() <= publication_index:
+                continue
+
+            row_text = normalize(row.inner_text())
+
+            if EXAM_KEYWORD not in row_text:
+                continue
+
+            normalized_date = normalize(EXAM_DATE)
+            iso_date = "2026-09-30"
+
+            if normalized_date not in row_text and iso_date not in row_text:
+                continue
+
+            publication_date = cells.nth(publication_index).inner_text().strip()
+
+            status_index = next(
+                (
+                    i for i, name in enumerate(header_names)
+                    if name == "statut"
+                ),
+                None,
+            )
+
+            status = (
+                cells.nth(status_index).inner_text().strip()
+                if status_index is not None and cells.count() > status_index
+                else ""
+            )
+
+            matching_rows.append({
+                "publication_date": publication_date,
+                "status": status,
+            })
+
+    if len(matching_rows) == 0:
+        raise RuntimeError(
+            "Could not find the expected Sproochentest row or publication "
+            "date column. No state was changed."
+        )
+
+    if len(matching_rows) > 1:
+        raise RuntimeError(
+            "Multiple matching Sproochentest registrations were found. "
+            "Refusing to monitor an ambiguous registration."
+        )
+
+    return matching_rows[0]
 
 
 def main():
-    previous = load_state()
+    previous_state = load_state()
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
-
-        context = browser.new_context(
-            locale="fr-FR",
-            accept_downloads=False,
-        )
-
+        context = browser.new_context(locale="fr-FR")
         page = context.new_page()
         page.set_default_timeout(15000)
 
         try:
             login(page)
-            open_registrations(page)
-            registration = find_exam_registration(page)
+            registration = get_registration_row(page)
 
-            new_state = {
-                "registration": registration,
-            }
+            current_date = registration["publication_date"]
+            previous_registration = (
+                previous_state.get("registration")
+                if previous_state
+                else None
+            )
 
-            if previous is None:
-                save_state(new_state)
-                send_telegram(
-                    "INL monitor started.\n"
-                    "Your Sproochentest registration was found.\n"
-                    "I will notify you when its displayed information changes."
-                )
-                print("Initial state saved; no change alert sent.")
+            current_state = {"registration": registration}
+
+            if previous_state is None:
+                save_state(current_state)
+
+                if current_date:
+                    send_telegram(
+                        "INL Sproochentest results may already be available.\n"
+                        f"Publication date shown: {current_date}\n"
+                        f"Registration status: {registration['status'] or 'Not shown'}\n\n"
+                        f"Verify your account: {REGISTRATION_URL}"
+                    )
+                    print("Initial check found a publication date.")
+                else:
+                    send_telegram(
+                        "INL results monitor is active.\n"
+                        "Your Sproochentest registration was found, and its "
+                        "results publication date is currently empty.\n"
+                        "I will notify you when a date appears."
+                    )
+                    print("Initial baseline saved; no results date shown.")
+
                 return
 
-            if previous.get("registration") != registration:
-                send_telegram(
-                    "INL Sproochentest registration changed!\n\n"
-                    f"Previous: {previous.get('registration', {}).get('text', 'Unknown')}\n\n"
-                    f"Current: {registration['text']}\n\n"
-                    "Log in to MyINL to verify whether your results have "
-                    "been published:\n"
-                    "https://myinl.inll.lu/fr_FR/web/login"
-                )
+            old_date = (
+                previous_registration.get("publication_date", "")
+                if previous_registration
+                else ""
+            )
 
-                save_state(new_state)
-                print("Registration change detected and notification sent.")
+            if current_date and current_date != old_date:
+                send_telegram(
+                    "INL Sproochentest results publication date detected!\n\n"
+                    f"Publication date: {current_date}\n"
+                    f"Registration status: {registration['status'] or 'Not shown'}\n\n"
+                    "Log in to verify your results:\n"
+                    f"{REGISTRATION_URL}"
+                )
+                save_state(current_state)
+                print("Publication date changed; Telegram alert sent.")
+
+            elif not current_date and old_date:
+                save_state(current_state)
+                print("Publication date is empty again; state updated.")
+
             else:
-                print("No change detected.")
+                # Save status changes without claiming they mean results
+                # have been published.
+                if previous_registration != registration:
+                    save_state(current_state)
+
+                print("No new results publication date detected.")
 
         finally:
             context.close()
@@ -230,6 +314,9 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        # Avoid printing credentials, tokens, or page contents to logs.
-        print(f"Monitor failed: {type(error).__name__}: {error}", file=sys.stderr)
+        # Never print tokens, passwords, cookies, or page contents.
+        print(
+            f"Monitor failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
         sys.exit(1)
