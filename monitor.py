@@ -303,7 +303,12 @@ def main():
                 if previous_registration != registration:
                     save_state(current_state)
 
-                print("No new results publication date detected.")
+                send_telegram("INL Sproochentest monitor check completed.\n\n"
+                f"Publication date: {current_date or 'Not published yet'}\n"
+                f"Registration status: {registration['status'] or 'Not shown'}\n\n"
+                "I will check again at the next scheduled run."
+                )
+                print("No new results publication date detected. Status message sent.")
 
         finally:
             context.close()
